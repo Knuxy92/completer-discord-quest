@@ -1,92 +1,65 @@
-# Script.js
+# Complete Recent Discord Quest
 
-This script is designed to **automate and accelerate Discord Quests progression** (such as WATCH_VIDEO and PLAY_ON_DESKTOP) by hooking into Discord’s internal webpack modules and simulating the required activities.
-
-> ⚠️ **Important Warning**: Scripts of this nature may violate Discord’s Terms of Service. This project is provided **for educational and research purposes only**. Use at your own risk.
-
----
-
-## Features
-
-* Automatically detects active quests that are not yet completed and not expired
-* Auto-enrolls quests if not already enrolled
-* Supports the following quest task types:
-
-  * `WATCH_VIDEO`
-  * `WATCH_VIDEO_ON_MOBILE`
-  * `PLAY_ON_DESKTOP`
-  * `STREAM_ON_DESKTOP`
-* Simulates video watch progress via API calls
-* Simulates desktop gameplay by injecting fake running game processes
-* Processes multiple quests sequentially with a staggered delay to reduce conflicts
+> [!NOTE]
+> For quests that require playing a game, this does **not** work in the browser — use the [Discord Desktop App](https://discord.com/download) instead.
 
 ---
 
-## File
+## Credit
 
-* **Script.js** – Main automation script
-
----
-
-## How It Works (High-Level)
-
-1. Injects into Discord’s webpack runtime to access internal stores and APIs
-2. Locates quest, running game, and streaming stores dynamically (supports multiple export layouts)
-3. Filters eligible quests based on status, expiration, and supported task types
-4. Enrolls quests automatically if required
-5. Progresses quests by:
-
-   * Periodically sending video progress timestamps for video-based quests
-   * Creating and dispatching fake running game data for desktop play quests
-6. Monitors quest heartbeat events to determine completion
+Base script: [aamiaa](https://gist.github.com/aamiaa/204cd9d42013ded9faf646fae7f89fbb#file-completediscordquest-md)  
+Cleaned & optimized by: **Knuxy92**  
+Last updated: `04/25/26`
 
 ---
 
-## Supported Tasks
+## How to Use
 
-| Task Type             | Method                             |
-| --------------------- | ---------------------------------- |
-| WATCH_VIDEO           | Sends `/video-progress` timestamps |
-| WATCH_VIDEO_ON_MOBILE | Same as WATCH_VIDEO                |
-| PLAY_ON_DESKTOP       | Injects fake running game process  |
-| STREAM_ON_DESKTOP     | Uses active stream metadata        |
+1. Open Discord and go to the **Quests** tab, then accept the quest you want to complete
+2. Press `Ctrl` + `Shift` + `I` to open **DevTools**
+3. Navigate to the **Console** tab
+4. Paste the code from `Script.js` and hit Enter
 
 ---
 
-## Usage
+## Supported Task Types
 
-1. Open **Discord Desktop App** (recommended)
-2. Open **Developer Tools** (Ctrl + Shift + I)
-3. Go to the **Console** tab
-4. Paste the contents of `Script.js`
-5. Press **Enter** and let the script run
-
-The console will display real-time quest progress and completion logs.
-
----
-
-## Logs Example
-
-```
-[QuestManager] Found 2 active quests. Starting staggered processing...
-[Video] Started: Watch a Trailer
-[Video] Watch a Trailer: 14/60s
-[Video] Completed: Watch a Trailer
-[Game] Started: Play Game X
-[Game] Play Game X: 120/120s
-[Game] Completed: Play Game X
-```
-
----
-
-## Notes
-
-* Progress timing includes small randomization to reduce detection patterns
-* Fake game processes are removed immediately after quest completion
-* Script assumes Discord internal APIs and store structures may change at any time
+| Task | Platform | 
+|------|----------|
+| `WATCH_VIDEO` | Browser / Desktop 
+| `WATCH_VIDEO_ON_MOBILE` | Browser / Desktop 
+| `PLAY_ON_DESKTOP` | Desktop only 
+| `STREAM_ON_DESKTOP` | Desktop only 
 
 ---
 
 ## Disclaimer
 
-This repository is **not affiliated with or endorsed by Discord**. The author is not responsible for any account actions, bans, or losses resulting from the use of this script.
+Use at your own risk — automating Discord quests may violate [Discord's Terms of Service](https://discord.com/terms).  
+The author is not responsible for any account actions taken by Discord.
+
+---
+
+## License
+
+MIT License
+
+Copyright (c) 2026 Lightnine
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
