@@ -8,7 +8,6 @@
 ## Credit
 
 Base script: [aamiaa](https://gist.github.com/aamiaa/204cd9d42013ded9faf646fae7f89fbb#file-completediscordquest-md)  
-Cleaned & optimized by: **Knuxy92**  
 Last updated: `04/25/26`
 
 ---
