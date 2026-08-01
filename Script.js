@@ -22,7 +22,7 @@
       for (const { key, value } of readExports(m.exports)) {
         try {
           if (predicate(value, key, m)) return { id, key, value, module: m };
-        } catch {}
+        } catch { /* ponytail: module getters may throw on access; skip silently */ }
       }
     }
     return null;
@@ -72,6 +72,38 @@
   const isApp = typeof DiscordNative !== "undefined";
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+  const fakeGamesMap = new Map();
+  const realGetRunningGames = RunningGameStore.getRunningGames;
+  const realGetGameForPID   = RunningGameStore.getGameForPID;
+  const realStreamMetadata  = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
+
+  RunningGameStore.getRunningGames = () => [...fakeGamesMap.values()];
+  RunningGameStore.getGameForPID   = pid => fakeGamesMap.get(pid);
+
+  const dispatchGames = () =>
+    FluxDispatcher.dispatch({
+      type: "RUNNING_GAMES_CHANGE",
+      removed: [],
+      added: [...fakeGamesMap.values()],
+      games: [...fakeGamesMap.values()],
+    });
+
+  const restoreAll = () => {
+    RunningGameStore.getRunningGames = realGetRunningGames;
+    RunningGameStore.getGameForPID   = realGetGameForPID;
+    ApplicationStreamingStore.getStreamerActiveStreamMetadata = realStreamMetadata;
+  };
+
+  const getTaskName = quest => {
+    const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
+    return SUPPORTED_TASKS.find(t => taskConfig.tasks[t]);
+  };
+
+  const readHeartbeatProgress = (quest, data, taskName) =>
+    quest.config.configVersion === 1
+      ? (data.userStatus?.streamProgressSeconds ?? 0)
+      : Math.floor(data.userStatus?.progress?.[taskName]?.value ?? 0);
+
   const enrollQuest = async (questId, questName) => {
     console.log(`[Enroll] ${questName}`);
     try {
@@ -86,6 +118,7 @@
     const name = quest.config.messages.questName;
     let progress = quest.userStatus?.progress?.[taskName]?.value ?? 0;
     const speed = 7;
+    let completed = false;
 
     console.log(`[Video] Start: ${name}`);
 
@@ -100,11 +133,23 @@
           body: { timestamp },
         });
         progress = timestamp;
+        completed = !!res.body.completed_at;
         console.log(`[Video] ${name}: ${Math.floor(progress)}/${target}s`);
-        if (res.body.completed_at) break;
+        if (completed) break;
       } catch (e) {
         console.log(`[Video] ${name} heartbeat failed:`, e?.message ?? e);
         await sleep(5000);
+      }
+    }
+
+    if (!completed) {
+      try {
+        await api.post({
+          url: `/quests/${quest.id}/video-progress`,
+          body: { timestamp: target },
+        });
+      } catch (e) {
+        console.log(`[Video] ${name} final heartbeat failed:`, e?.message ?? e);
       }
     }
 
@@ -152,38 +197,21 @@
     }
 
     const fakeGame = createFakeGame(appData, applicationId);
-
-    const realGetRunningGames = RunningGameStore.getRunningGames;
-    const realGetGameForPID   = RunningGameStore.getGameForPID;
-    const realGames = realGetRunningGames();
-
-    RunningGameStore.getRunningGames = () => [fakeGame];
-    RunningGameStore.getGameForPID   = pid => (pid === fakeGame.pid ? fakeGame : undefined);
-
-    FluxDispatcher.dispatch({
-      type: "RUNNING_GAMES_CHANGE",
-      removed: realGames,
-      added: [fakeGame],
-      games: [fakeGame],
-    });
+    fakeGamesMap.set(fakeGame.pid, fakeGame);
+    dispatchGames();
 
     const secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
     console.log(`[Game] Spoofed: ${appData.name}. Wait ${Math.ceil((target - secondsDone) / 60)} min.`);
 
     await new Promise(resolve => {
       const onHeartbeat = data => {
-        const progress = Math.floor(data.userStatus?.progress?.[taskName]?.value ?? 0);
+        if (data.userStatus?.questId !== quest.id) return;
+        const progress = readHeartbeatProgress(quest, data, taskName);
         console.log(`[Game] ${name}: ${progress}/${target}s`);
 
         if (progress >= target) {
-          RunningGameStore.getRunningGames = realGetRunningGames;
-          RunningGameStore.getGameForPID   = realGetGameForPID;
-          FluxDispatcher.dispatch({
-            type: "RUNNING_GAMES_CHANGE",
-            removed: [fakeGame],
-            added: [],
-            games: [],
-          });
+          fakeGamesMap.delete(fakeGame.pid);
+          dispatchGames();
           FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
           console.log(`[Game] Done: ${name}`);
           resolve();
@@ -207,7 +235,6 @@
     }
 
     const pid = Math.floor(Math.random() * 30000) + 1000;
-    const realFunc = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
 
     ApplicationStreamingStore.getStreamerActiveStreamMetadata = () => ({
       id: applicationId,
@@ -221,11 +248,11 @@
 
     await new Promise(resolve => {
       const onHeartbeat = data => {
-        const progress = Math.floor(data.userStatus?.progress?.[taskName]?.value ?? 0);
+        if (data.userStatus?.questId !== quest.id) return;
+        const progress = readHeartbeatProgress(quest, data, taskName);
         console.log(`[Stream] ${name}: ${progress}/${target}s`);
 
         if (progress >= target) {
-          ApplicationStreamingStore.getStreamerActiveStreamMetadata = realFunc;
           FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
           console.log(`[Stream] Done: ${name}`);
           resolve();
@@ -286,8 +313,8 @@
 
   const processQuest = async quest => {
     const name       = quest.config.messages.questName;
+    const taskName   = getTaskName(quest);
     const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
-    const taskName   = SUPPORTED_TASKS.find(t => taskConfig.tasks[t]);
     const taskData   = taskConfig.tasks[taskName];
     const target     = taskData.target;
     const applicationId = quest.config.application?.id ?? taskData.applications?.[0]?.id;
@@ -310,15 +337,26 @@
 
   if (!pending.length) {
     console.log("[QuestManager] No pending quests.");
+    restoreAll();
     return;
   }
 
-  console.clear();
-  console.log(`[QuestManager] ${pending.length} quest(s) found — processing...`);
+  const streamQuests = pending.filter(q => getTaskName(q) === "STREAM_ON_DESKTOP");
+  const otherQuests = pending.filter(q => getTaskName(q) !== "STREAM_ON_DESKTOP");
 
-  for (const quest of pending) {
-    await processQuest(quest);
+  console.clear();
+  console.log(`[QuestManager] ${pending.length} quest(s) found.`);
+  if (streamQuests.length > 1) {
+    console.log(`[QuestManager] Serializing ${streamQuests.length} stream quest(s); others parallel.`);
   }
 
+  await Promise.all([
+    ...otherQuests.map(processQuest),
+    (async () => {
+      for (const q of streamQuests) await processQuest(q);
+    })(),
+  ]);
+
+  restoreAll();
   console.log("[QuestManager] All quests done.");
 })();
