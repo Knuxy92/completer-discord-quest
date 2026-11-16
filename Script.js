@@ -1,362 +1,230 @@
-(async () => {
+(() => {
+  "use strict";
   delete window.$;
 
   const wpRequire = webpackChunkdiscord_app.push([[Symbol()], {}, r => r]);
   webpackChunkdiscord_app.pop();
 
+  const methods = ["get", "post", "put", "patch", "del"];
   const isLocaleProxy = v =>
     String(v?.dispatch).includes("e.get") ||
     String(v?.subscribe).includes("e.get") ||
-    v?.$$loader;
-
-  const readExports = exp => {
-    if (!exp || (typeof exp !== "object" && typeof exp !== "function")) return [];
-    return Reflect.ownKeys(exp).flatMap(k => {
-      try { return [{ key: k, value: exp[k] }]; }
-      catch { return []; }
-    });
-  };
+    Boolean(v?.$$loader) ||
+    v?.[Symbol.toStringTag] === "IntlMessagesProxy";
 
   const findExport = predicate => {
-    for (const [id, m] of Object.entries(wpRequire.c)) {
-      for (const { key, value } of readExports(m.exports)) {
+    for (const [id, mod] of Object.entries(wpRequire?.c ?? {})) {
+      const exp = mod?.exports;
+      if (!exp || exp === window || !["object", "function"].includes(typeof exp)) continue;
+      for (const key of Reflect.ownKeys(exp)) {
         try {
-          if (predicate(value, key, m)) return { id, key, value, module: m };
-        } catch { /* ponytail: module getters may throw on access; skip silently */ }
+          const value = exp[key];
+          if (predicate(value, key, mod)) return value;
+        } catch {}
       }
     }
     return null;
   };
 
-  const QuestsStore = findExport(v =>
-    v?.getQuest && v.quests instanceof Map
-  )?.value;
+  const rapi =
+    findExport((v, key) => key === "Bo" && !isLocaleProxy(v) && methods.every(m => typeof v?.[m] === "function")) ??
+    findExport(v => !isLocaleProxy(v) && typeof v?.getAPIBaseURL === "function" && methods.every(m => typeof v?.[m] === "function"));
 
-  const ApplicationStreamingStore = findExport(v =>
-    v?.getStreamerActiveStreamMetadata
-  )?.value;
+  const GLOBAL_KEY = "__discordQuestAuto";
+  const ENROLL_DELAY_MS = 1500;
+  const RETRY_DELAY_MS = 8000;
+  const MAX_RETRIES = 2;
+  const state = { running: false, abort: false, quests: new Map(), log: [] };
 
-  const RunningGameStore = findExport((v, k) =>
-    k === "Ay" && typeof v?.getRunningGames === "function" && typeof v?.getGameForPID === "function"
-  )?.value;
+  function log(level, message, detail) {
+    const entry = { at: new Date().toISOString(), level, message };
+    if (detail !== undefined) entry.detail = detail;
+    state.log.push(entry);
+    const prefix = level === "error" ? "✖" : level === "warn" ? "!" : "›";
+    console.log(`${prefix} [QuestManager] ${message}`, detail ?? "");
+  }
 
-  const ChannelStore = findExport(v =>
-    typeof v?.getAllThreadsForParent === "function" &&
-    typeof v?.getSortedPrivateChannels === "function"
-  )?.value;
+  const sleep = ms => new Promise(resolve => {
+    const start = Date.now();
+    const tick = () => {
+      if (state.abort) return resolve(false);
+      const remaining = ms - (Date.now() - start);
+      if (remaining <= 0) return resolve(true);
+      setTimeout(tick, Math.min(remaining, 500));
+    };
+    tick();
+  });
 
-  const GuildChannelStore = findExport((v, k) =>
-    k === "Ay" && typeof v?.getSFWDefaultChannel === "function" && typeof v?.getAllGuilds === "function"
-  )?.value;
-
-  const FluxDispatcher = findExport(v =>
-    !isLocaleProxy(v) &&
-    typeof v?.dispatch === "function" &&
-    typeof v?.subscribe === "function" &&
-    typeof v?.flushWaitQueue === "function"
-  )?.value;
-
-  const api = findExport((v, k) =>
-    k === "Bo" &&
-    ["get", "post", "put", "patch", "del"].every(m => typeof v?.[m] === "function")
-  )?.value;
-
-  const SUPPORTED_TASKS = [
-    "WATCH_VIDEO",
-    "PLAY_ON_DESKTOP",
-    "STREAM_ON_DESKTOP",
-    "PLAY_ACTIVITY",
-    "WATCH_VIDEO_ON_MOBILE",
-  ];
-
-  const isApp = typeof DiscordNative !== "undefined";
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-  const fakeGamesMap = new Map();
-  const realGetRunningGames = RunningGameStore.getRunningGames;
-  const realGetGameForPID   = RunningGameStore.getGameForPID;
-  const realStreamMetadata  = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
-
-  RunningGameStore.getRunningGames = () => [...fakeGamesMap.values()];
-  RunningGameStore.getGameForPID   = pid => fakeGamesMap.get(pid);
-
-  const dispatchGames = () =>
-    FluxDispatcher.dispatch({
-      type: "RUNNING_GAMES_CHANGE",
-      removed: [],
-      added: [...fakeGamesMap.values()],
-      games: [...fakeGamesMap.values()],
-    });
-
-  const restoreAll = () => {
-    RunningGameStore.getRunningGames = realGetRunningGames;
-    RunningGameStore.getGameForPID   = realGetGameForPID;
-    ApplicationStreamingStore.getStreamerActiveStreamMetadata = realStreamMetadata;
+  const parseResponse = value => {
+    if (!value) return null;
+    try { return JSON.parse(value); } catch { return value; }
   };
 
-  const getTaskName = quest => {
-    const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
-    return SUPPORTED_TASKS.find(t => taskConfig.tasks[t]);
-  };
-
-  const readHeartbeatProgress = (quest, data, taskName) =>
-    quest.config.configVersion === 1
-      ? (data.userStatus?.streamProgressSeconds ?? 0)
-      : Math.floor(data.userStatus?.progress?.[taskName]?.value ?? 0);
-
-  const enrollQuest = async (questId, questName) => {
-    console.log(`[Enroll] ${questName}`);
-    try {
-      await api.post({ url: `/quests/${questId}/enroll` });
-      await sleep(2000);
-    } catch (e) {
-      console.log(`[Enroll] Failed for ${questName}:`, e?.message ?? e);
+  async function apiRequest(method, path, body) {
+    if (!rapi) throw new Error("Discord internal REST API module not found");
+    const fn = rapi[method];
+    const response = await fn.call(rapi, { url: path, ...(body !== undefined ? { body } : {}) });
+    const data = response?.body ?? parseResponse(response?.text) ?? response;
+    if (typeof response?.status === "number" && response.status >= 400) {
+      const error = new Error(`Request rejected (HTTP ${response.status})`);
+      error.status = response.status;
+      error.body = data;
+      throw error;
     }
-  };
+    return data;
+  }
 
-  const processVideoQuest = async (quest, taskName, target) => {
-    const name = quest.config.messages.questName;
-    let progress = quest.userStatus?.progress?.[taskName]?.value ?? 0;
-    const speed = 7;
-    let completed = false;
-
-    console.log(`[Video] Start: ${name}`);
-
-    while (progress < target) {
-      const remaining = Math.min(speed, target - progress);
-      await sleep(remaining * 1000);
-
-      const timestamp = Math.min(target, progress + speed + Math.random());
-      try {
-        const res = await api.post({
-          url: `/quests/${quest.id}/video-progress`,
-          body: { timestamp },
-        });
-        progress = timestamp;
-        completed = !!res.body.completed_at;
-        console.log(`[Video] ${name}: ${Math.floor(progress)}/${target}s`);
-        if (completed) break;
-      } catch (e) {
-        console.log(`[Video] ${name} heartbeat failed:`, e?.message ?? e);
-        await sleep(5000);
-      }
-    }
-
-    if (!completed) {
-      try {
-        await api.post({
-          url: `/quests/${quest.id}/video-progress`,
-          body: { timestamp: target },
-        });
-      } catch (e) {
-        console.log(`[Video] ${name} final heartbeat failed:`, e?.message ?? e);
-      }
-    }
-
-    console.log(`[Video] Done: ${name}`);
-  };
-
-  const createFakeGame = (appData, applicationId) => {
-    const pid   = Math.floor(Math.random() * 30000) + 1000;
-    const safe  = (appData.name || "UnknownGame").replace(/\s/g, "");
-    const lower = safe.toLowerCase();
+  function normalizeQuest(raw) {
+    const config = raw?.config ?? {};
+    const status = raw?.userStatus ?? raw?.user_status ?? {};
+    const messages = config.messages ?? {};
+    const taskConfig = config.taskConfigV2 ?? config.task_config_v2 ?? config.taskConfig ?? config.task_config;
+    const tasks = taskConfig?.tasks ?? {};
 
     return {
-      id: applicationId, name: appData.name, pid,
-      pidPath: [pid], start: Date.now(),
-      exeName: `${safe}.exe`,
-      exePath: `c:/program files/${lower}/${lower}.exe`,
-      processName: safe,
-      cmdLine: `C:\\Program Files\\${safe}\\${safe}.exe`,
-      hidden: false, isLauncher: false,
+      id: raw?.id,
+      name: messages.questName ?? messages.quest_name ?? raw?.id ?? "Unknown quest",
+      startsAt: config.startsAt ?? config.starts_at ?? null,
+      expiresAt: config.expiresAt ?? config.expires_at ?? null,
+      hasTasks: Object.keys(tasks).length > 0,
+      enrolled: Boolean(status.enrolledAt ?? status.enrolled_at),
+      completed: Boolean(status.completedAt ?? status.completed_at),
+      claimed: Boolean(status.claimedAt ?? status.claimed_at)
     };
+  }
+
+  const isExpired = (quest, now) => {
+    if (!quest.expiresAt) return false;
+    const time = new Date(quest.expiresAt).getTime();
+    return Number.isFinite(time) && time <= now;
   };
 
-  const processGameQuest = async (quest, taskName, target, applicationId) => {
-    const name = quest.config.messages.questName;
-
-    if (!applicationId) {
-      console.log(`[Game] ${name}: no applicationId, skipping.`);
-      return;
-    }
-
-    if (!isApp) {
-      console.log(`[Game] ${name}: requires desktop app, skipping.`);
-      return;
-    }
-
-    let appData;
-    try {
-      const res = await api.get({
-        url: `/applications/public?application_ids=${applicationId}`,
-      });
-      appData = res.body[0];
-    } catch (e) {
-      console.log(`[Game] Failed to fetch app data for ${name}:`, e?.message ?? e);
-      return;
-    }
-
-    const fakeGame = createFakeGame(appData, applicationId);
-    fakeGamesMap.set(fakeGame.pid, fakeGame);
-    dispatchGames();
-
-    const secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
-    console.log(`[Game] Spoofed: ${appData.name}. Wait ${Math.ceil((target - secondsDone) / 60)} min.`);
-
-    await new Promise(resolve => {
-      const onHeartbeat = data => {
-        if (data.userStatus?.questId !== quest.id) return;
-        const progress = readHeartbeatProgress(quest, data, taskName);
-        console.log(`[Game] ${name}: ${progress}/${target}s`);
-
-        if (progress >= target) {
-          fakeGamesMap.delete(fakeGame.pid);
-          dispatchGames();
-          FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
-          console.log(`[Game] Done: ${name}`);
-          resolve();
-        }
-      };
-      FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
-    });
+  const hasStarted = (quest, now) => {
+    if (!quest.startsAt) return true;
+    const time = new Date(quest.startsAt).getTime();
+    return !Number.isFinite(time) || time <= now;
   };
 
-  const processStreamQuest = async (quest, taskName, target, applicationId) => {
-    const name = quest.config.messages.questName;
+  function getSkipReason(quest, now) {
+    if (quest.claimed) return "already_claimed";
+    if (quest.completed) return "already_completed";
+    if (quest.enrolled) return "already_enrolled";
+    if (isExpired(quest, now)) return "expired";
+    if (!hasStarted(quest, now)) return "not_started_yet";
+    if (!quest.hasTasks) return "no_tasks";
+    return null;
+  }
 
-    if (!applicationId) {
-      console.log(`[Stream] ${name}: no applicationId, skipping.`);
-      return;
-    }
+  async function fetchCurrentQuests() {
+    const response = await apiRequest("get", "/quests/@me");
+    return {
+      quests: (Array.isArray(response?.quests) ? response.quests : []).map(normalizeQuest),
+      enrollmentBlockedUntil: response?.quest_enrollment_blocked_until ?? null,
+      accessSuspendedUntil: response?.quest_access_suspended_until ?? null
+    };
+  }
 
-    if (!isApp) {
-      console.log(`[Stream] ${name}: requires desktop app, skipping.`);
-      return;
-    }
-
-    const pid = Math.floor(Math.random() * 30000) + 1000;
-
-    ApplicationStreamingStore.getStreamerActiveStreamMetadata = () => ({
-      id: applicationId,
-      pid,
-      sourceName: null,
-    });
-
-    const secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
-    console.log(`[Stream] ${name}: spoofed. Stream any window in VC for ${Math.ceil((target - secondsDone) / 60)} min.`);
-    console.log(`[Stream] Need at least 1 other person in the VC!`);
-
-    await new Promise(resolve => {
-      const onHeartbeat = data => {
-        if (data.userStatus?.questId !== quest.id) return;
-        const progress = readHeartbeatProgress(quest, data, taskName);
-        console.log(`[Stream] ${name}: ${progress}/${target}s`);
-
-        if (progress >= target) {
-          FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
-          console.log(`[Stream] Done: ${name}`);
-          resolve();
-        }
-      };
-      FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", onHeartbeat);
-    });
-  };
-
-  const processActivityQuest = async (quest, taskName, target) => {
-    const name = quest.config.messages.questName;
-
-    const channelId =
-      ChannelStore.getSortedPrivateChannels()[0]?.id ??
-      Object.values(GuildChannelStore.getAllGuilds())
-        .find(x => x != null && x.VOCAL.length > 0)?.VOCAL[0]?.channel?.id;
-
-    if (!channelId) {
-      console.log(`[Activity] ${name}: no voice channel found, skipping.`);
-      return;
-    }
-
-    const streamKey = `call:${channelId}:1`;
-    console.log(`[Activity] Start: ${name}`);
-
-    while (true) {
-      let progress;
+  async function enrollQuest(quest) {
+    for (let attempt = 0; ; attempt++) {
       try {
-        const res = await api.post({
-          url: `/quests/${quest.id}/heartbeat`,
-          body: { stream_key: streamKey, terminal: false },
+        await apiRequest("post", `/quests/${encodeURIComponent(quest.id)}/enroll`, {
+          location: 11,
+          is_targeted: false
         });
-        progress = res.body.progress.PLAY_ACTIVITY.value;
-        console.log(`[Activity] ${name}: ${progress}/${target}s`);
-      } catch (e) {
-        console.log(`[Activity] ${name} heartbeat failed:`, e?.message ?? e);
-        await sleep(20000);
-        continue;
+        quest.enrolled = true;
+        log("info", `Accepted "${quest.name}"`, { questId: quest.id });
+        return;
+      } catch (error) {
+        const retryable = !error.status || error.status >= 500;
+        if (!retryable || attempt >= MAX_RETRIES || state.abort) throw error;
+        log("warn", `Temporary enrollment error for "${quest.name}"; retry ${attempt + 1}/${MAX_RETRIES}`);
+        if (!await sleep(RETRY_DELAY_MS)) throw new Error("Operation stopped");
+      }
+    }
+  }
+
+  async function run() {
+    if (state.running) return log("warn", "Already running");
+    if (!rapi) return log("error", "Discord internal REST API module not found");
+
+    state.running = true;
+    state.abort = false;
+    state.quests.clear();
+    state.log.length = 0;
+
+    const summary = { enrolled: [], skipped: [], failed: [], aborted: [] };
+
+    try {
+      const listing = await fetchCurrentQuests();
+
+      if (listing.enrollmentBlockedUntil || listing.accessSuspendedUntil) {
+        log("warn", "Quest enrollment or access is temporarily restricted", {
+          enrollmentBlockedUntil: listing.enrollmentBlockedUntil,
+          accessSuspendedUntil: listing.accessSuspendedUntil
+        });
+        return summary;
       }
 
-      if (progress >= target) {
-        try {
-          await api.post({
-            url: `/quests/${quest.id}/heartbeat`,
-            body: { stream_key: streamKey, terminal: true },
-          });
-        } catch (e) {
-          console.log(`[Activity] ${name} terminal heartbeat failed:`, e?.message ?? e);
+      const quests = listing.quests;
+      const now = Date.now();
+      log("info", `Found ${quests.length} quest(s)`);
+
+      for (const quest of quests) {
+        const record = { id: quest.id, name: quest.name, status: "pending", reason: null };
+        state.quests.set(quest.id, record);
+
+        const reason = getSkipReason(quest, now);
+        if (reason) {
+          record.status = "skipped";
+          record.reason = reason;
+          summary.skipped.push({ name: quest.name, reason });
+          continue;
         }
-        break;
-      }
 
-      await sleep(20000);
+        if (!await sleep(ENROLL_DELAY_MS)) {
+          record.status = "aborted";
+          summary.aborted.push(quest.name);
+          break;
+        }
+
+        try {
+          await enrollQuest(quest);
+          record.status = "enrolled";
+          summary.enrolled.push(quest.name);
+        } catch (error) {
+          if (state.abort) {
+            record.status = "aborted";
+            summary.aborted.push(quest.name);
+            break;
+          }
+          record.status = "failed";
+          record.reason = error.message;
+          summary.failed.push({ name: quest.name, reason: error.message, status: error.status ?? 0 });
+          log("error", `Failed to accept "${quest.name}"`, error.body ?? error.message);
+        }
+      }
+    } catch (error) {
+      log("error", "Quest retrieval failed", error.body ?? error.message);
+    } finally {
+      state.running = false;
+      log("info", "Enrollment run finished", summary);
     }
 
-    console.log(`[Activity] Done: ${name}`);
-  };
-
-  const processQuest = async quest => {
-    const name       = quest.config.messages.questName;
-    const taskName   = getTaskName(quest);
-    const taskConfig = quest.config.taskConfig ?? quest.config.taskConfigV2;
-    const taskData   = taskConfig.tasks[taskName];
-    const target     = taskData.target;
-    const applicationId = quest.config.application?.id ?? taskData.applications?.[0]?.id;
-
-    if (!quest.userStatus?.enrolledAt) await enrollQuest(quest.id, name);
-
-    if (taskName.includes("WATCH_VIDEO"))      await processVideoQuest(quest, taskName, target);
-    else if (taskName === "PLAY_ON_DESKTOP")   await processGameQuest(quest, taskName, target, applicationId);
-    else if (taskName === "STREAM_ON_DESKTOP") await processStreamQuest(quest, taskName, target, applicationId);
-    else if (taskName === "PLAY_ACTIVITY")     await processActivityQuest(quest, taskName, target);
-  };
-
-  const pending = [...QuestsStore.quests.values()].filter(q =>
-    !q.userStatus?.completedAt &&
-    Date.now() < new Date(q.config.expiresAt).getTime() &&
-    SUPPORTED_TASKS.some(t =>
-      Object.keys((q.config.taskConfig ?? q.config.taskConfigV2).tasks).includes(t)
-    )
-  );
-
-  if (!pending.length) {
-    console.log("[QuestManager] No pending quests.");
-    restoreAll();
-    return;
+    return summary;
   }
 
-  const streamQuests = pending.filter(q => getTaskName(q) === "STREAM_ON_DESKTOP");
-  const otherQuests = pending.filter(q => getTaskName(q) !== "STREAM_ON_DESKTOP");
-
-  console.clear();
-  console.log(`[QuestManager] ${pending.length} quest(s) found.`);
-  if (streamQuests.length > 1) {
-    console.log(`[QuestManager] Serializing ${streamQuests.length} stream quest(s); others parallel.`);
+  function stop() {
+    state.abort = true;
+    log("warn", "Stop requested");
   }
 
-  await Promise.all([
-    ...otherQuests.map(processQuest),
-    (async () => {
-      for (const q of streamQuests) await processQuest(q);
-    })(),
-  ]);
+  const questAuto = { stop, fetchCurrentQuests, state };
+  globalThis[GLOBAL_KEY] = questAuto;
+  globalThis.questAuto = questAuto;
 
-  restoreAll();
-  console.log("[QuestManager] All quests done.");
+  console.log(`%c[QuestManager] Starting... (REST API: ${rapi ? "OK" : "NOT FOUND"})`, "font-weight:bold");
+  run().catch(error => {
+    state.running = false;
+    log("error", "Unexpected runtime error", error?.message ?? error);
+  });
 })();
